@@ -10,5 +10,4 @@ slurm-*.out
 src/evals
 src/evals-*
 src/slurms
-algonauts_2023_challenge_submission/
-.ipynb_checkpoints/
+algonauts_2023_challenge_submission
