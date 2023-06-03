@@ -1,0 +1,13 @@
+**/__pycache__/
+**/*.ipynb_checkpoints
+**/checkpoints
+**/.DS_Store
+**/wandb
+**/train_logs
+slurm-*.out
+
+*.pth
+src/evals
+src/evals-*
+src/slurms
+algonauts_2023_challenge_submission
