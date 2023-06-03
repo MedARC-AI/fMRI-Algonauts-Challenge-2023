@@ -18,3 +18,7 @@ Please join the (MedARC Discord)[https://discord.com/invite/CqsMthnauZ] to join 
 cd fMRI-Algonauts-Challenge-2023/src
 . setup.sh
 ```
+
+## Usage
+
+See train_decoder.ipynb
