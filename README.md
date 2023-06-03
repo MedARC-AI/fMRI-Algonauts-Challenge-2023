@@ -10,7 +10,7 @@ Please join the [MedARC Discord](https://discord.com/invite/CqsMthnauZ) to join 
 
 1. Download this repository: ``git clone https://github.com/MedARC-AI/fMRI-Algonauts-Challenge-2023.git``
 
-2. Download our [webdataset implementation](https://huggingface.co/datasets/pscotti/naturalscenesdataset/tree/main/algonauts) of the Algonauts Challenge data. (If you are on Stability HPC, it is located in ``/fsx/proj-medarc/fmri/natural-scenes-dataset/algonauts_data/wds``)
+2. Download our [webdataset implementation](https://huggingface.co/datasets/pscotti/naturalscenesdataset/tree/main/algonauts) of the Algonauts Challenge training data. (If you are on Stability HPC, it is located in ``/fsx/proj-medarc/fmri/natural-scenes-dataset/algonauts_data/wds``)
 
 3. Run ``setup.sh`` to create a conda environment that contains the packages necessary to run our scripts; activate the environment with ``conda activate mindeye``.
 
