@@ -209,3 +209,78 @@ def select_annotations(annots, random=False):
             txt = np.vstack((txt, t))
     txt = txt.flatten()
     return txt
+
+def get_dataloaders(
+    batch_size,
+    num_devices=None,
+    num_workers=None,
+    train_url=None,
+    val_url=None,
+    meta_url=None,
+    num_train=None,
+    num_val=None,
+    cache_dir="/tmp/wds-cache",
+    seed=0,
+    voxels_key="vert.npy",
+    val_batch_size=None,
+    local_rank=0,
+):
+    if local_rank==0: print("Getting dataloaders...")
+
+    metadata = json.load(open(meta_url))
+    if num_val is None:
+        num_val = 300
+    if num_train is None:
+        num_train = metadata['total'] - num_val
+
+    if local_rank==0: print('Prepping train and validation dataloaders...')
+    
+    def my_split_by_node(urls):
+        return urls
+
+    global_batch_size = batch_size * num_devices
+    num_batches = math.floor(num_train / global_batch_size)
+    num_worker_batches = math.floor(num_batches / num_workers)
+    
+    if local_rank==0: print("\nnum_train",num_train)
+    if local_rank==0: print("global_batch_size",global_batch_size)
+    if local_rank==0: print("num_batches",num_batches)
+
+    train_data = wds.WebDataset(train_url, resampled=False, cache_dir=cache_dir, nodesplitter=wds.split_by_node)\
+        .shuffle(500, initial=500, rng=random.Random(seed))\
+        .decode("torch")\
+        .rename(images="jpg;png", voxels="vert.npy", latent="clip_emb_hidden.npy")\
+        .to_tuple("voxels", "images", "latent")\
+        .batched(batch_size, partial=False)\
+        .with_epoch(num_worker_batches)
+    train_dl = torch.utils.data.DataLoader(train_data, 
+                            num_workers=min(num_workers, num_worker_batches),
+                            batch_size=None, shuffle=False, persistent_workers=True)
+    
+    if local_rank==0: print("\nnum_val", num_val)
+    if local_rank==0: print("val_batch_size", val_batch_size)
+
+    val_data = wds.WebDataset(val_url, resampled=False, nodesplitter=wds.split_by_node)\
+        .decode("torch")\
+        .rename(voxels="vert.npy", latent="clip_emb_hidden.npy")\
+        .to_tuple("voxels", "latent")\
+        .batched(val_batch_size, partial=False)
+    val_dl = torch.utils.data.DataLoader(val_data, num_workers=1,
+                    batch_size=None, shuffle=False, persistent_workers=True)
+
+    return train_dl, val_dl, num_train, num_val
+
+def voxel_select(voxels):
+    if voxels.ndim == 2:
+        return voxels
+    choice = torch.rand(1)
+    # random combine
+    if choice <= 0.5:
+        weights = torch.rand(voxels.shape[0], voxels.shape[1])[:,:,None].to(voxels.device)
+        return (weights * voxels).sum(1)/weights.sum(1)
+    # mean
+    if choice <= 0.8:
+        return voxels.mean(1)
+    # random select
+    randints = torch.randint(0, voxels.shape[1], (voxels.shape[0],))
+    return voxels[torch.arange(voxels.shape[0]), randints]
