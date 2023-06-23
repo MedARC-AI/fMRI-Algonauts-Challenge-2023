@@ -336,9 +336,9 @@ if __name__ == '__main__':
 
     print('Pulling NSD webdataset data...')
     # local paths
-    train_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/algonauts_data/wds/subj01_{2..98}.tar"
-    val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/algonauts_data/wds/subj01_{0..2}.tar"
-    meta_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/algonauts_data/wds/metadata_subj01.json"
+    train_url = "/fsx/proj-fmri/shared/algonauts_wds/subj01_{2..98}.tar"
+    val_url = "/fsx/proj-fmri/shared/algonauts_wds/subj01_{0..2}.tar"
+    meta_url = "/fsx/proj-fmri/shared/algonauts_wds/metadata_subj01.json"
 
     train_dl, val_dl, num_train, num_val = utils.get_dataloaders(
         batch_size,
@@ -365,7 +365,7 @@ if __name__ == '__main__':
     voxel2clip = BrainNetworkNoDETR(**voxel2clip_kwargs)
     rev_v2c = ReverseBrainNetwork(**voxel2clip_kwargs)
 
-    diff_prior_weights = torch.load('/fsx/proj-medarc/fmri/paulscotti/fMRI-Algonauts-Challenge-2023/train_logs/vert2clip_subj01__/last.pth')['model_state_dict']
+    diff_prior_weights = torch.load('../train_logs/models/prior_s1/last.pth', map_location=device)['model_state_dict']
     v2c_weights = {}
     for k,v in diff_prior_weights.items():
         if 'voxel2clip' in k:
@@ -527,6 +527,7 @@ if __name__ == '__main__':
             fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(preds, voxel), labels, k=1).item()
             bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(voxel, preds), labels, k=1).item()
 
+            import pdb; pdb.set_trace()
             accelerator.backward(loss)
             optimizer.step()
 

@@ -9,12 +9,11 @@ sbatch << EOT
 #SBATCH --cpus-per-gpu 8                # Number of cores
 #SBATCH -N 1                    # Force single node
 #SBATCH --time 20:00:00         # Runtime in D-HH:MM, minimum of 10 minutes
-#SBATCH --partition g40         # Partition to submit to
-#SBATCH --gpus 1        # Number of GPUs
+#SBATCH --partition g40x         # Partition to submit to
+#SBATCH --gpus 2        # Number of GPUs
 #SBATCH --mem 64000         # Memory pool for all cores (see also --mem-per-cpu)
 #SBATCH -o ../train_logs/slurm/$2.out  # %j inserts jobid
 #SBATCH -e ../train_logs/slurm/$2.err  # %j inserts jobid
-#SBATCH --exclude=ip-26-0-129-240,ip-26-0-129-157,ip-26-0-131-188
 
 export NUM_GPUS=1
 echo NUM_GPUS=\${NUM_GPUS}

@@ -653,6 +653,7 @@ class BrainDiffusionPrior(DiffusionPrior):
         text_embed = None,      # allow for training on preprocessed CLIP text and image embeddings
         image_embed = None,
         text_encodings = None,  # as well as CLIP text encodings
+        times = None,
         *args,
         **kwargs
     ):
@@ -690,7 +691,8 @@ class BrainDiffusionPrior(DiffusionPrior):
         # timestep conditioning from ddpm
 
         batch, device = image_embed.shape[0], image_embed.device
-        times = self.noise_scheduler.sample_random_times(batch)
+        if times is None:
+            times = self.noise_scheduler.sample_random_times(batch)
 
         # scale image embed (Katherine)
 

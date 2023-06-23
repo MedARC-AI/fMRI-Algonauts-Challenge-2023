@@ -27,7 +27,7 @@ def is_interactive():
     import __main__ as main
     return not hasattr(main, '__file__')
 
-def seed_everything(seed=0, cudnn_deterministic=True):
+def seed_everything(seed=0, cudnn_deterministic=False):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
