@@ -284,3 +284,25 @@ def voxel_select(voxels):
     # random select
     randints = torch.randint(0, voxels.shape[1], (voxels.shape[0],))
     return voxels[torch.arange(voxels.shape[0]), randints]
+
+def pearson_correlation(x, y):
+    xm = x - x.mean(0, keepdim=True)
+    ym = y - y.mean(0, keepdim=True)
+    
+    r_num = xm.T @ ym  # 39k, 39k
+    r_den = ((xm.T**2).sum(1, keepdim=True) @ (ym**2).sum(0, keepdim=True))**0.5
+    r_val = r_num / r_den
+    
+    return r_val
+
+def soft_corr_loss(pred, targ, temp=0.125):
+    pred_targ = pearson_correlation(pred, targ)/temp
+    targ_targ = pearson_correlation(targ, targ)/temp
+
+    loss1 = -(pred_targ.log_softmax(-1) * targ_targ.softmax(-1)).sum(-1).mean()
+    loss2 = -(pred_targ.T.log_softmax(-1) * targ_targ.softmax(-1)).sum(-1).mean()
+    
+    loss = (loss1 + loss2)/2
+    return loss
+
+

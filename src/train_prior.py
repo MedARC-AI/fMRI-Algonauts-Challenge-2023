@@ -16,7 +16,7 @@ from kornia.augmentation.container import AugmentationSequential
 
 import utils
 from utils import torch_to_matplotlib, torch_to_Image
-from models import Clipper, OpenClipper, BrainNetworkNoDETR, ReverseBrainNetwork
+from models import Clipper, OpenClipper, DiffusionBrainNetwork, C2VDiffusionPriorNetwork, BrainDiffusionPrior
 
 import torch.distributed as dist
 from accelerate import Accelerator
@@ -26,6 +26,7 @@ import argparse
 import math
 import random
 import webdataset as wds
+from torchmetrics import PearsonCorrCoef
 
 
 def parse_args():
@@ -33,15 +34,8 @@ def parse_args():
     parser.add_argument(
         "--model_name",
         type=str,
-        default="prior_257_test",
+        default="rev_prior_257_test",
         help="name of model, used for wandb logging",
-    )
-    parser.add_argument(
-        "--modality",
-        type=str,
-        default="image",
-        choices=["image", "text"],
-        help="image or text",
     )
     parser.add_argument(
         "--clip_variant",
@@ -50,12 +44,6 @@ def parse_args():
         choices=["RN50", "ViT-L/14", "ViT-B/32"],
         help='clip variant',
     )
-    # parser.add_argument(
-    #     "--outdir",
-    #     type=str,
-    #     default=None,
-    #     help="output directory for logs and checkpoints",
-    # )
     parser.add_argument(
         "--wandb_log",
         action="store_true",
@@ -66,19 +54,6 @@ def parse_args():
         type=str,
         default="stability",
         help="wandb project name",
-    )
-    parser.add_argument(
-        "--h5_dir",
-        type=str,
-        default='/scratch/gpfs/KNORMAN/nsdgeneral_hdf5/',
-        help="directory containing COCO h5 files (only used for modality=text)",
-    )
-    parser.add_argument(
-        "--voxel_dims",
-        type=int,
-        default=1,
-        choices=[1, 3],
-        help="1 for flattened input, 3 for 3d input",
     )
     parser.add_argument(
         "--remote_data",
@@ -110,11 +85,6 @@ def parse_args():
         help="output location",
     )
     parser.add_argument(
-        "--normed_mse",
-        action="store_true",
-        help="output location",
-    )
-    parser.add_argument(
         "--cont_loss_type",
         type=str,
         default="flatten",
@@ -122,44 +92,14 @@ def parse_args():
         help="loss type",
     )
     parser.add_argument(
-        "--no_full_train_set",
-        action="store_true",
-        help="whether to disable image augmentation (only used for modality=image)",
-    )
-    parser.add_argument(
-        "--v2c_projector",
-        action="store_true",
-        help="whether to disable image augmentation (only used for modality=image)",
-    )
-    parser.add_argument(
-        "--pretrained_v2c",
-        action="store_true",
-        help="whether to disable image augmentation (only used for modality=image)",
-    )
-    parser.add_argument(
         "--ckpt_path",
         type=str,
         default=None
     )
     parser.add_argument(
-        "--cont_loss_cands",
-        choices=["none", "v2c", "prior", "v2c_prior"],
-        default="v2c"
-    )
-    parser.add_argument(
-        "--mse_loss_cands",
-        choices=["prior", "v2c_prior"],
-        default="prior"
-    )
-    parser.add_argument(
         "--mixup_pct",
         type=float,
         default=0.33
-    )
-    parser.add_argument(
-        "--bidir_mixco",
-        action="store_true",
-        help="make mixco bidirectional"
     )
     parser.add_argument(
         "--num_epochs",
@@ -172,21 +112,12 @@ def parse_args():
         default=0.5
     )
     parser.add_argument(
-        "--soft_loss_type",
-        choices=["clip", "cont_flatten", "cont_inter"],
-        default="clip"
-    )
-    parser.add_argument(
         "--subj_id",
-        choices=["01", "02", "05", "07"],
+        choices=["01", "02", "03", "04", "05", "06", "07", "08"],
         default="01"
     )
     parser.add_argument(
-        "--no_versatile",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--causal",
+        "--train_rev_v2c",
         action="store_true",
     )
     return parser.parse_args()
@@ -279,8 +210,10 @@ if __name__ == '__main__':
     
     # params for all models
     seed = 0
-    batch_size = 32
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')    
+    batch_size = 64
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if args.train_rev_v2c:
+        device2 = torch.device('cuda:1')
 
     num_epochs = args.num_epochs
     lr_scheduler = 'cycle'
@@ -300,7 +233,6 @@ if __name__ == '__main__':
 
     cache_dir = 'cache'
     mixup_pct = args.mixup_pct
-    loss_type = args.cont_loss_type
 
     resume_from_ckpt = args.ckpt_path is not None
     ckpt_path = args.ckpt_path
@@ -322,7 +254,14 @@ if __name__ == '__main__':
     num_workers = 1
 
     # auto resume
-    if os.path.exists(os.path.join(outdir, 'last.pth')):
+    if os.path.exists(os.path.join(outdir, 'last.pth')) or os.path.exists(os.path.join(outdir, 'last_old.pth')):
+        if os.path.exists(os.path.join(outdir, 'last_old.pth')):
+            if os.path.exists(os.path.join(outdir, 'last.pth')):
+                # this is corrupted
+                os.remove(os.path.join(outdir, f'last.pth'))
+            # set last_old as last
+            shutil.move(os.path.join(outdir, f'last_old.pth'), os.path.join(outdir, f'last.pth'))
+        
         ckpt_path = os.path.join(outdir, 'last.pth')
         resume_from_ckpt = True
 
@@ -336,9 +275,15 @@ if __name__ == '__main__':
 
     print('Pulling NSD webdataset data...')
     # local paths
-    train_url = "/fsx/proj-fmri/shared/algonauts_wds/subj01_{2..98}.tar"
-    val_url = "/fsx/proj-fmri/shared/algonauts_wds/subj01_{0..2}.tar"
-    meta_url = "/fsx/proj-fmri/shared/algonauts_wds/metadata_subj01.json"
+    if args.subj_id in [3,6]:
+        max_tar = 90
+    elif args.subj_id in [4,8]:
+        max_tar = 87
+    else:
+        max_tar = 98
+    train_url = f"/fsx/proj-fmri/shared/algonauts_wds/subj{args.subj_id}_{{3..{max_tar}}}.tar"
+    val_url = f"/fsx/proj-fmri/shared/algonauts_wds/subj{args.subj_id}_{{0..2}}.tar"
+    meta_url = f"/fsx/proj-fmri/shared/algonauts_wds/metadata_subj{args.subj_id}.json"
 
     train_dl, val_dl, num_train, num_val = utils.get_dataloaders(
         batch_size,
@@ -360,28 +305,40 @@ if __name__ == '__main__':
     out_dim = clip_sizes[clip_variant]
 
     voxel2clip_kwargs = dict(out_dim=out_dim, norm_type='ln', act_first=False, encoder_tokens=257, use_projector=False)
-    in_dims = {'01': 39548, '02': 14278, '05': 13039, '07':12682}
+    in_dims = {'01': 39548, '02': 39548, '03': 39548, '04': 39548, '05': 39548, '06': 39198, '07': 39548, '08': 39511}
     voxel2clip_kwargs["in_dim"] = in_dims[subj_id]
-    voxel2clip = BrainNetworkNoDETR(**voxel2clip_kwargs)
-    rev_v2c = ReverseBrainNetwork(**voxel2clip_kwargs)
+    rev_v2c = DiffusionBrainNetwork(**voxel2clip_kwargs)
 
-    diff_prior_weights = torch.load('../train_logs/models/prior_s1/last.pth', map_location=device)['model_state_dict']
-    v2c_weights = {}
-    for k,v in diff_prior_weights.items():
-        if 'voxel2clip' in k:
-            v2c_weights['.'.join(k.split('.')[1:])] = v
-    voxel2clip.load_state_dict(v2c_weights, strict=False)
-    del diff_prior_weights, v2c_weights
-    voxel2clip.eval()
-    voxel2clip.requires_grad_(False)
-    voxel2clip.to(device)
-    rev_v2c.to(device)
-    
+    # setup prior network
+    depth = 6
+    dim_head = 64
+    heads = 12 # heads * dim_head = 12 * 64 = 768
+    timesteps = 100
+    prior_network = C2VDiffusionPriorNetwork(
+        dim=out_dim,
+        depth=depth,
+        dim_head=dim_head,
+        heads=heads,
+        causal=False,
+        learned_query_mode="pos_emb",
+        clip_to_voxel=rev_v2c
+    ).to(device)
+    # custom version that can fix seeds
+    rev_diffusion_prior = BrainDiffusionPrior(
+        net=prior_network,
+        image_embed_dim=out_dim,
+        condition_on_text_encodings=False,
+        timesteps=timesteps,
+        cond_drop_prob=0.2,
+        image_embed_scale=None,
+        voxel2clip=None
+    ).to(device)
+    torch.cuda.empty_cache()
     
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
     opt_grouped_parameters = [
-        {'params': [p for n, p in rev_v2c.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': 1e-2},
-        {'params': [p for n, p in rev_v2c.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+        {'params': [p for n, p in rev_diffusion_prior.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': 1e-2},
+        {'params': [p for n, p in rev_diffusion_prior.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
     ]
     optimizer = torch.optim.AdamW(opt_grouped_parameters, lr=initial_lr) # lr doesnt get used if lr_scheduler='cycle'
 
@@ -402,20 +359,28 @@ if __name__ == '__main__':
         if tag == "last" and os.path.exists(os.path.join(outdir, f'{tag}.pth')):
             shutil.copyfile(os.path.join(outdir, f'{tag}.pth'), os.path.join(outdir, f'{tag}_old.pth'))
             # shutil.move(os.path.join(outdir, f'{tag}.pth'), os.path.join(outdir, f'{tag}_old.pth'))
+        
         ckpt_path = os.path.join(outdir, f'{tag}.pth')
         print(f'saving {ckpt_path}',flush=True)
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': rev_v2c.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'train_losses': losses,
-            'val_losses': val_losses,
-            'fwd_percent_correct': fwd_percent_correct,
-            'bwd_percent_correct': bwd_percent_correct,
-            'val_fwd_percent_correct': val_fwd_percent_correct,
-            'val_bwd_percent_correct': val_bwd_percent_correct,
-            'lrs': lrs,
-            }, ckpt_path)
+        if tag == "last":
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': rev_diffusion_prior.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_losses': losses,
+                'val_losses': val_losses,
+                "val/val_corr": val_corr,
+                'lrs': lrs,
+                'best_val_corr': best_val_corr
+                }, ckpt_path)
+        else:
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': rev_diffusion_prior.state_dict(),
+                "val/val_corr": val_corr,
+                'best_val_corr': best_val_corr
+                }, ckpt_path)
+        
         if tag == "last" and os.path.exists(os.path.join(outdir, f'{tag}_old.pth')):
             os.remove(os.path.join(outdir, f'{tag}_old.pth'))
 
@@ -462,15 +427,15 @@ if __name__ == '__main__':
             resume="allow"
         )
             
-    #----ACCELERATE------------
-    rev_v2c, optimizer, train_dl, val_dl, lr_scheduler = accelerator.prepare(
-        rev_v2c, optimizer, train_dl, val_dl, lr_scheduler
-    )
+    # #----ACCELERATE------------
+    # rev_diffusion_prior, rev_v2c, optimizer, train_dl, val_dl, lr_scheduler = accelerator.prepare(
+    #     rev_diffusion_prior, rev_v2c, optimizer, train_dl, val_dl, lr_scheduler
+    # )
 
     epoch = 0
     losses, mse_losses, val_losses, lrs = [], [], [], []
-    best_val_loss = 1e9
-    soft_loss_temps = utils.cosine_anneal(0.004, 0.0075, num_epochs - int(mixup_pct * num_epochs))
+    best_val_corr = 0
+    soft_loss_temps = utils.cosine_anneal(0.004, 0.0075, num_epochs)
 
     voxel0 = image0 = val_voxel0 = val_image0 = None
 
@@ -480,7 +445,9 @@ if __name__ == '__main__':
         checkpoint = torch.load(ckpt_path, map_location=device)
         epoch = checkpoint['epoch']+1
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])        
-        rev_v2c.load_state_dict(checkpoint['model_state_dict'])
+        rev_diffusion_prior.load_state_dict(checkpoint['model_state_dict'])
+        if 'best_val_corr' in checkpoint:
+            best_val_corr = checkpoint['best_val_corr']
         global_batch_size = batch_size * num_devices
         total_steps_done = epoch*(num_train//global_batch_size)
         for _ in range(total_steps_done):
@@ -489,8 +456,11 @@ if __name__ == '__main__':
         torch.cuda.empty_cache()
 
     progress_bar = tqdm(range(epoch,num_epochs), disable=(local_rank!=0))
+    start_device = device2 if args.train_rev_v2c else device
+    pearson = PearsonCorrCoef(in_dims[subj_id]).to(start_device)
+
     for epoch in progress_bar:
-        rev_v2c.train()
+        rev_diffusion_prior.train()
 
         sims = 0.
         sims_base = 0.
@@ -498,36 +468,41 @@ if __name__ == '__main__':
         val_sims_base = 0.
         fwd_percent_correct = 0.
         bwd_percent_correct = 0.
-        val_fwd_percent_correct = 0.
-        val_bwd_percent_correct = 0.
+        val_corr = 0.
+        train_corr = 0.
         loss_mse_sum = 0.
+        loss_corr_sum = 0.
         val_loss_mse_sum = 0.
 
-        for train_i, (voxel, _, _) in enumerate(train_dl):
+        for train_i, (voxel, _, latent) in enumerate(train_dl):
             optimizer.zero_grad()
 
-            voxel = voxel.float().to(device)
+            voxel = voxel.float().to(start_device)
             voxel = utils.voxel_select(voxel)
+            clip_target = latent.to(device).float().squeeze(1)
 
             if epoch < int(mixup_pct * num_epochs):
                 voxel, perm, betas, select = utils.mixco(voxel)
+                betas_shape = [-1] + [1]*(len(clip_target.shape)-1)
+                clip_target_prior = clip_target * betas.reshape(*betas_shape).to(device) + clip_target[perm] * (1-betas.reshape(*betas_shape)).to(device)
+            else:
+                clip_target_prior = clip_target
+
+            loss, preds, _ = rev_diffusion_prior(text_embed=clip_target_prior, image_embed=voxel)
             
-            with torch.no_grad():
-                intermediate_embs = voxel2clip(voxel)
-            preds = rev_v2c(intermediate_embs)
-            loss = F.mse_loss(preds, voxel)
+            recons_corr = pearson(preds, voxel)
+            recons_corr_loss = utils.soft_corr_loss(preds, voxel, temp=soft_loss_temps[epoch])
+            
+            loss_corr_sum += recons_corr_loss.item()
+            train_corr += ((recons_corr**2)*100).mean().item()
 
             loss_mse_sum += loss.item()
+            loss = loss + recons_corr_loss
             utils.check_loss(loss)
             losses.append(loss.item())
             lrs.append(optimizer.param_groups[0]['lr'])
+            del preds, clip_target, clip_target_prior, latent, voxel
 
-            # forward and backward top 1 accuracy
-            labels = torch.arange(len(voxel)).to(device)
-            fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(preds, voxel), labels, k=1).item()
-            bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(voxel, preds), labels, k=1).item()
-
-            import pdb; pdb.set_trace()
             accelerator.backward(loss)
             optimizer.step()
 
@@ -537,41 +512,43 @@ if __name__ == '__main__':
             # logs = {"train/loss": np.mean(losses[-(train_i+1):]),
             #         "train/lr": lrs[-1],
             #         "train/num_steps": len(losses),
-            #         "train/cosine_sim_base": sims_base / (train_i + 1),
-            #         "train/fwd_pct_correct": fwd_percent_correct / (train_i + 1),
-            #         "train/bwd_pct_correct": bwd_percent_correct / (train_i + 1),
-            #         "train/loss_nce": loss_nce_sum / (train_i + 1),
-            #         "train/mse_loss": loss_prior_sum / (train_i + 1),
-            #         # "train/alpha": alpha,
+            #         "val/num_steps": len(val_losses),
+            #         "val/val_corr": val_corr,
+            #         "train/train_corr": train_corr / (train_i + 1),
+            #         "train/mse_loss": loss_mse_sum / (train_i + 1),
+            #         "train/recons_loss": loss_recons_sum / (train_i + 1),
+            #         "train/recons_corr_loss": loss_corr_sum / (train_i + 1),
             #     }
             # progress_bar.set_postfix(**logs)
         
         if local_rank==0:
-            rev_v2c.eval()
-            for val_i, (voxel, _) in enumerate(val_dl): 
+            rev_diffusion_prior.eval()
+            for val_i, (voxel, latent) in enumerate(val_dl): 
                 with torch.inference_mode():
-                    voxel = voxel.float().to(device)
+                    voxel = voxel.float().to(start_device)
                     voxel = voxel.mean(1)
+                    clip_target = latent.to(device).float().squeeze(1)
                     
-                    preds = rev_v2c(voxel2clip(voxel))
-                    val_loss = F.mse_loss(preds, voxel)
+                    val_loss, preds, _ = rev_diffusion_prior(
+                        text_embed=clip_target, image_embed=voxel, 
+                        times=torch.zeros(clip_target.shape[0], dtype=torch.long).to(device)
+                    )
                     
                     val_loss_mse_sum += val_loss.item()
                     val_losses.append(val_loss.item())
 
-                    labels = torch.arange(len(voxel)).to(device)
-                    val_fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(preds, voxel), labels, k=1).item()
-                    val_bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(voxel, preds), labels, k=1).item()
+                    corr_coefs = pearson(preds, voxel)
+                    val_corr = ((corr_coefs**2)*100).mean().item()
             
             logs = {"train/loss": np.mean(losses[-(train_i+1):]),
                     "val/loss": np.mean(val_losses[-(val_i+1):]),
                     "train/lr": lrs[-1],
                     "train/num_steps": len(losses),
                     "val/num_steps": len(val_losses),
-                    "train/fwd_pct_correct": fwd_percent_correct / (train_i + 1),
-                    "train/bwd_pct_correct": bwd_percent_correct / (train_i + 1),
-                    "val/val_fwd_pct_correct": val_fwd_percent_correct / (val_i + 1),
-                    "val/val_bwd_pct_correct": val_bwd_percent_correct / (val_i + 1),
+                    "val/val_corr": val_corr,
+                    "train/train_corr": train_corr / (train_i + 1),
+                    "train/mse_loss": loss_mse_sum / (train_i + 1),
+                    "train/recons_corr_loss": loss_corr_sum / (train_i + 1),
                 }
             progress_bar.set_postfix(**logs)
             
@@ -583,6 +560,11 @@ if __name__ == '__main__':
                     except:
                         print('Wandb log failed. Retrying')
                         time.sleep(1)
+            
+            if val_corr > best_val_corr:
+                print(f'Saving new best at epoch {epoch}')
+                save_ckpt('best')
+                best_val_corr = float(val_corr)
 
         if ckpt_saving and local_rank==0:
             try:
