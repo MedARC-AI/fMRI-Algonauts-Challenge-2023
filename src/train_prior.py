@@ -16,7 +16,7 @@ from kornia.augmentation.container import AugmentationSequential
 
 import utils
 from utils import torch_to_matplotlib, torch_to_Image
-from models import Clipper, OpenClipper, DiffusionBrainNetwork, C2VDiffusionPriorNetwork, BrainDiffusionPrior
+from models import Clipper, OpenClipper, TimeGuidedBrainNetwork, C2VDiffusionPriorNetwork, C2VBrainDiffusionPrior
 
 import torch.distributed as dist
 from accelerate import Accelerator
@@ -304,10 +304,11 @@ if __name__ == '__main__':
     # output dim for voxel2clip model
     out_dim = clip_sizes[clip_variant]
 
-    voxel2clip_kwargs = dict(out_dim=out_dim, norm_type='ln', act_first=False, encoder_tokens=257, use_projector=False)
+    voxel2clip_kwargs = dict(out_dim=out_dim, norm_type='ln', act_first=False, encoder_tokens=128, use_projector=False)
     in_dims = {'01': 39548, '02': 39548, '03': 39548, '04': 39548, '05': 39548, '06': 39198, '07': 39548, '08': 39511}
     voxel2clip_kwargs["in_dim"] = in_dims[subj_id]
-    rev_v2c = DiffusionBrainNetwork(**voxel2clip_kwargs)
+    v2c = TimeGuidedBrainNetwork(revers=False, **voxel2clip_kwargs)
+    c2v = TimeGuidedBrainNetwork(**voxel2clip_kwargs)
 
     # setup prior network
     depth = 6
@@ -321,10 +322,11 @@ if __name__ == '__main__':
         heads=heads,
         causal=False,
         learned_query_mode="pos_emb",
-        clip_to_voxel=rev_v2c
+        voxel_to_enc=v2c,
+        enc_to_voxel=c2v
     ).to(device)
     # custom version that can fix seeds
-    rev_diffusion_prior = BrainDiffusionPrior(
+    rev_diffusion_prior = C2VBrainDiffusionPrior(
         net=prior_network,
         image_embed_dim=out_dim,
         condition_on_text_encodings=False,
@@ -488,8 +490,7 @@ if __name__ == '__main__':
             else:
                 clip_target_prior = clip_target
 
-            loss, preds, _ = rev_diffusion_prior(text_embed=clip_target_prior, image_embed=voxel)
-            
+            loss, preds = rev_diffusion_prior(voxel, image_embed=clip_target_prior)
             recons_corr = pearson(preds, voxel)
             recons_corr_loss = utils.soft_corr_loss(preds, voxel, temp=soft_loss_temps[epoch])
             

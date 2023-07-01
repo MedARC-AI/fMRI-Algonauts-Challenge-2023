@@ -590,6 +590,7 @@ class BrainDiffusionPrior(DiffusionPrior):
 
     @torch.no_grad()
     def p_sample_loop_ddpm(self, shape, text_cond, cond_scale = 1., generator=None):
+        #
         batch, device = shape[0], self.device
 
         if generator is None:
@@ -1143,15 +1144,17 @@ class Voxel2StableDiffusionModel(torch.nn.Module):
         
         return self.upsampler(sd_embeds)
 
-class ReverseBrainNetwork(nn.Module):
-    def __init__(self, out_dim=768, in_dim=15724, h=4096, n_blocks=4, norm_type='bn', act_first=True, encoder_tokens=257, **kwargs):
+class ReversibleBrainNetwork(nn.Module):
+    def __init__(self, out_dim=768, in_dim=15724, h=4096, n_blocks=4, norm_type='bn', act_first=True, 
+                 encoder_tokens=257, reverse=True, **kwargs):
         super().__init__()
         norm_func = partial(nn.BatchNorm1d, num_features=h) if norm_type == 'bn' else partial(nn.LayerNorm, normalized_shape=h)
         act_fn = partial(nn.ReLU, inplace=True) if norm_type == 'bn' else nn.GELU
         act_and_norm = (act_fn, norm_func) if act_first else (norm_func, act_fn)
-        self.temp = nn.Parameter(torch.tensor(.006))
+        # self.temp = nn.Parameter(torch.tensor(.006))
+        start_dim, end_dim = (out_dim*encoder_tokens, in_dim) if reverse else (in_dim, out_dim*encoder_tokens)
         self.lin0 = nn.Sequential(
-            nn.Linear(out_dim*encoder_tokens, h),
+            nn.Linear(start_dim, h),
             *[item() for item in act_and_norm],
             nn.Dropout(0.5),
         )
@@ -1164,7 +1167,7 @@ class ReverseBrainNetwork(nn.Module):
             ) for _ in range(n_blocks)
         ])
         
-        self.lin1 = nn.Linear(h, in_dim, bias=True)
+        self.lin1 = nn.Linear(h, end_dim, bias=True)
         self.n_blocks = n_blocks
         
     def forward(self, x):
@@ -1178,11 +1181,12 @@ class ReverseBrainNetwork(nn.Module):
         x = self.lin1(x)
         return x
 
-class DiffusionBrainNetwork(ReverseBrainNetwork):
+class TimeGuidedBrainNetwork(ReversibleBrainNetwork):
     # 950M
-    def __init__(self, out_dim=768, in_dim=15724, h=4096, n_blocks=4, norm_type='bn', act_first=True, encoder_tokens=257, **kwargs):
+    def __init__(self, out_dim=768, in_dim=15724, h=4096, n_blocks=4, norm_type='bn', act_first=True,
+                 encoder_tokens=257, reverse=True, **kwargs):
         # encoder
-        super().__init__(out_dim, in_dim, h, n_blocks, norm_type, act_first, encoder_tokens)
+        super().__init__(out_dim, in_dim, h, n_blocks, norm_type, act_first, encoder_tokens, reverse)
         # self.norm = nn.LayerNorm(out_dim)
         self.encoder_tokens = encoder_tokens
         self.time_scalers = nn.ModuleList([
@@ -1223,49 +1227,29 @@ class C2VDiffusionPriorNetwork(VersatileDiffusionPriorNetwork):
         num_tokens = 257,
         causal = True,
         learned_query_mode = 'none',
-        clip_to_voxel=nn.Identity(),
+        voxel_to_enc=nn.Identity(),
+        enc_to_voxel=nn.Identity(),
         **kwargs
     ):
         super().__init__(dim, num_timesteps, num_time_embeds, num_tokens,
                          causal, learned_query_mode, **kwargs)
-        self.clip_to_voxel = clip_to_voxel
+        self.voxel_to_enc = voxel_to_enc
+        self.enc_to_voxel = enc_to_voxel
 
     def forward(
         self,
-        image_embed,
+        voxel,
         diffusion_timesteps,
         *,
-        self_cond=None,
-        brain_embed=None,
-        text_embed=None,
-        brain_cond_drop_prob = 0.,
-        text_cond_drop_prob = None,
-        image_cond_drop_prob = 0.
+        image_embed=None,
+        image_cond_drop_prob = 0.,
     ):
-        if text_embed is not None:
-            brain_embed = text_embed
-        if text_cond_drop_prob is not None:
-            brain_cond_drop_prob = text_cond_drop_prob
         
         batch, _, dim, device, dtype = *image_embed.shape, image_embed.device, image_embed.dtype
         # num_time_embeds, num_image_embeds, num_brain_embeds = self.num_time_embeds, self.num_image_embeds, self.num_brain_embeds
-        
-        # classifier free guidance masks
-        brain_keep_mask = prob_mask_like((batch,), 1 - brain_cond_drop_prob, device = device)
-        brain_keep_mask = rearrange(brain_keep_mask, 'b -> b 1 1')
 
         image_keep_mask = prob_mask_like((batch,), 1 - image_cond_drop_prob, device = device)
         image_keep_mask = rearrange(image_keep_mask, 'b -> b 1 1')
-
-        # mask out brain embeddings with null brain embeddings
-
-        # import pdb; pdb.set_trace()
-        null_brain_embeds = self.null_brain_embeds.to(brain_embed.dtype)
-        brain_embed = torch.where(
-            brain_keep_mask,
-            brain_embed,
-            null_brain_embeds[None]
-        )
 
         # mask out image embeddings with null image embeddings
         null_image_embed = self.null_image_embed.to(image_embed.dtype)
@@ -1275,71 +1259,54 @@ class C2VDiffusionPriorNetwork(VersatileDiffusionPriorNetwork):
             null_image_embed[None]
         )
 
-        # whether brain embedding is used for conditioning depends on whether brain encodings are available for attention (for classifier free guidance, even though it seems from the paper it was not used in the prior ddpm, as the objective is different)
-        # but let's just do it right
-        if self.continuous_embedded_time:
-            # if continuous cast to flat, else keep int for indexing embeddings
-            diffusion_timesteps = diffusion_timesteps.type(dtype)
         time_embed = self.to_time_embeds(diffusion_timesteps)
+        intermediate_embed = self.voxel_to_enc(voxel, time_embed)
 
         if self.learned_query_mode == 'token':
             learned_queries = repeat(self.learned_query, 'n d -> b n d', b = batch)
         elif self.learned_query_mode == 'pos_emb':
             pos_embs = repeat(self.learned_query, 'n d -> b n d', b = batch)
-            image_embed = image_embed + pos_embs
-            learned_queries = torch.empty((batch, 0, dim), device=brain_embed.device)
-        elif self.learned_query_mode == 'all_pos_emb':
-            pos_embs = repeat(self.learned_query, 'n d -> b n d', b = batch)
-            learned_queries = torch.empty((batch, 0, dim), device=brain_embed.device)
+            intermediate_embed = intermediate_embed + pos_embs
+            learned_queries = torch.empty((batch, 0, dim), device=image_embed.device)
         else:
-            learned_queries = torch.empty((batch, 0, dim), device=brain_embed.device)
+            learned_queries = torch.empty((batch, 0, dim), device=image_embed.device)
         
         tokens = torch.cat((
-            brain_embed,  # 257
-            time_embed,  # 1
             image_embed,  # 257
+            time_embed,  # 1
+            intermediate_embed,  # 257
             learned_queries  # 0|257
         ), dim = -2)
-        if self.learned_query_mode == 'all_pos_emb':
-            tokens = tokens + pos_embs
 
         # attend
         tokens = self.causal_transformer(tokens)
 
         # get learned query, which should predict the image embedding (per DDPM timestep)
-        pred_image_embed = tokens[..., -self.num_tokens:, :]
+        pred_voxel_embed = tokens[..., -self.num_tokens:, :]  # b,n,d
         # processed time_embed vs unprocessed
-        pred_voxel = self.clip_to_voxel(pred_image_embed, tokens[:, self.num_tokens].unsqueeze(1))
-        # pred_voxel = self.clip_to_voxel(pred_image_embed, time_embed)
+        # pred_voxel = self.enc_to_voxel(pred_voxel_embed, tokens[:, self.num_tokens].unsqueeze(1))
+        pred_voxel = self.enc_to_voxel(pred_voxel_embed, time_embed)  # b,v
         return pred_voxel
 
 class C2VBrainDiffusionPrior(BrainDiffusionPrior):
-    def p_losses(self, image_embed, times, text_cond, noise = None):
-        noise = default(noise, lambda: torch.randn_like(text_cond))
-
-        image_embed_noisy = self.noise_scheduler.q_sample(x_start = image_embed, t = times, noise = noise)
-
-        self_cond = None
-        if self.net.self_cond and random.random() < 0.5:
-            with torch.no_grad():
-                self_cond = self.net(image_embed_noisy, times, **text_cond).detach()
+    # for inference:
+    # p_sample_loop(shape=[b, 39k], text_cond={'image_embed': image_embed})
+    
+    def p_losses(self, voxel, times, image_embed, noise = None):
+        noise = default(noise, lambda: torch.randn_like(voxel))
+        voxel_noisy = self.noise_scheduler.q_sample(x_start = voxel, t = times, noise = noise)
 
         pred = self.net(
-            image_embed_noisy,
+            voxel_noisy,
             times,
-            self_cond = self_cond,
-            text_cond_drop_prob = self.text_cond_drop_prob,
             image_cond_drop_prob = self.image_cond_drop_prob,
-            **text_cond
+            image_embed=image_embed
         )
 
-        if self.predict_x_start and self.training_clamp_l2norm:
-            pred = self.l2norm_clamp_embed(pred)
-
         if self.predict_v:
-            target = self.noise_scheduler.calculate_v(image_embed, times, noise)
+            target = self.noise_scheduler.calculate_v(voxel, times, noise)
         elif self.predict_x_start:
-            target = image_embed
+            target = voxel
         else:
             target = noise
 
@@ -1348,62 +1315,24 @@ class C2VBrainDiffusionPrior(BrainDiffusionPrior):
 
     def forward(
         self,
-        text = None,
-        image = None,
-        voxel = None,
-        text_embed = None,      # allow for training on preprocessed CLIP text and image embeddings
-        image_embed = None,
-        text_encodings = None,  # as well as CLIP text encodings
+        voxel,
+        image_embed,
         times = None,
         *args,
         **kwargs
     ):
-        assert exists(text) ^ exists(text_embed) ^ exists(voxel), 'either text, text embedding, or voxel must be supplied'
-        assert exists(image) ^ exists(image_embed), 'either image or image embedding must be supplied'
-        assert not (self.condition_on_text_encodings and (not exists(text_encodings) and not exists(text))), 'text encodings must be present if you specified you wish to condition on it on initialization'
-
-        if exists(voxel):
-            assert exists(self.voxel2clip), 'voxel2clip must be trained if you wish to pass in voxels'
-            assert not exists(text_embed), 'cannot pass in both text and voxels'
-            if self.voxel2clip.use_projector:
-                clip_voxels_mse, clip_voxels = self.voxel2clip(voxel)
-                text_embed = clip_voxels_mse
-            else:
-                clip_voxels = self.voxel2clip(voxel)
-                text_embed = clip_voxels_mse = clip_voxels
-            # text_embed = self.voxel2clip(voxel)
-        else:
-            clip_voxels_mse = clip_voxels = None
-
-        if exists(image):
-            image_embed, _ = self.clip.embed_image(image)
-
-        # calculate text conditionings, based on what is passed in
-
-        if exists(text):
-            text_embed, text_encodings = self.clip.embed_text(text)
-
-        text_cond = dict(text_embed = text_embed)
-
-        if self.condition_on_text_encodings:
-            assert exists(text_encodings), 'text encodings must be present for diffusion prior if specified'
-            text_cond = {**text_cond, 'text_encodings': text_encodings}
-
-        # timestep conditioning from ddpm
-
-        batch, device = image_embed.shape[0], image_embed.device
+        batch, device = image_embed.shape[0], voxel.device
         if times is None:
             times = self.noise_scheduler.sample_random_times(batch)
 
         # scale image embed (Katherine)
-
-        image_embed *= self.image_embed_scale
+        # image_embed *= self.image_embed_scale
 
         # calculate forward loss
-        loss, pred = self.p_losses(image_embed, times, text_cond = text_cond, *args, **kwargs)
+        loss, pred = self.p_losses(voxel, times, image_embed, *args, **kwargs)
 
         # return denormalized pred, diff model learns to predict normalized pred
-        return loss, pred, (clip_voxels_mse, clip_voxels)
+        return loss, pred
 
 
 
