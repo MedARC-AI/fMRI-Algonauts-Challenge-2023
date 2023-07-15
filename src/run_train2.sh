@@ -8,7 +8,7 @@ sbatch << EOT
 #SBATCH --account topfmri
 #SBATCH --cpus-per-gpu 8                # Number of cores
 #SBATCH -N 1                    # Force single node
-#SBATCH --time 20:00:00         # Runtime in D-HH:MM, minimum of 10 minutes
+#SBATCH --time 30:00:00         # Runtime in D-HH:MM, minimum of 10 minutes
 #SBATCH --partition g40x         # Partition to submit to
 #SBATCH --gpus 2        # Number of GPUs
 #SBATCH --mem 64000         # Memory pool for all cores (see also --mem-per-cpu)

@@ -16,7 +16,7 @@ from kornia.augmentation.container import AugmentationSequential
 
 import utils
 from utils import torch_to_matplotlib, torch_to_Image
-from models import Clipper, OpenClipper, BrainNetworkNoDETR, ReverseBrainNetwork, VersatileDiffusionPriorNetwork, BrainDiffusionPrior
+from models import Clipper, OpenClipper, BrainNetworkNoDETR, ReversibleBrainNetwork, VersatileDiffusionPriorNetwork, BrainDiffusionPrior
 
 import torch.distributed as dist
 from accelerate import Accelerator
@@ -119,6 +119,11 @@ def parse_args():
     parser.add_argument(
         "--train_rev_v2c",
         action="store_true",
+    )
+    parser.add_argument(
+        "--pre_noise_norm",
+        choices=["none", "bn"],
+        default="bn"
     )
     return parser.parse_args()
 
@@ -309,7 +314,8 @@ if __name__ == '__main__':
     voxel2clip_kwargs["in_dim"] = in_dims[subj_id]
     voxel2clip = BrainNetworkNoDETR(**voxel2clip_kwargs)
 
-    diff_prior_path = f'/fsx/proj-fmri/paulscotti/fMRI-Algonauts-Challenge-2023/train_logs/v2c_subj{args.subj_id}/last.pth'
+    # diff_prior_path = f'/fsx/proj-fmri/paulscotti/fMRI-Algonauts-Challenge-2023/train_logs/v2c_subj{args.subj_id}/last.pth'
+    diff_prior_path = f'../train_logs/models/prior_fwd_bn_hialph/last.pth'
     diff_prior_weights = torch.load(diff_prior_path, map_location=device)['model_state_dict']
     v2c_weights = {}
     for k,v in diff_prior_weights.items():
@@ -321,7 +327,7 @@ if __name__ == '__main__':
     voxel2clip.requires_grad_(False)
     voxel2clip.to(device2 if args.train_rev_v2c else device)
 
-    rev_v2c = ReverseBrainNetwork(**voxel2clip_kwargs)
+    rev_v2c = ReversibleBrainNetwork(**voxel2clip_kwargs)
     # rev_v2c.load_state_dict(torch.load('../train_logs/models/s2_test/last.pth', map_location=device)['model_state_dict'])
     if not args.train_rev_v2c:
         rev_v2c.eval()
@@ -332,7 +338,7 @@ if __name__ == '__main__':
     depth = 6
     dim_head = 64
     heads = 12 # heads * dim_head = 12 * 64 = 768
-    timesteps = 100
+    timesteps = 1000
     prior_network = VersatileDiffusionPriorNetwork(
         dim=out_dim,
         depth=depth,
@@ -349,7 +355,8 @@ if __name__ == '__main__':
         timesteps=timesteps,
         cond_drop_prob=0.2,
         image_embed_scale=None,
-        voxel2clip=None
+        voxel2clip=None,
+        pre_noise_norm=args.pre_noise_norm,
     ).to(device)
     ####################
     ### Remove later ###
@@ -465,7 +472,7 @@ if __name__ == '__main__':
     epoch = 0
     losses, mse_losses, val_losses, lrs = [], [], [], []
     best_val_corr = 0
-    soft_loss_temps = utils.cosine_anneal(0.004, 0.0075, num_epochs - int(mixup_pct * num_epochs))
+    soft_loss_temps = utils.cosine_anneal(0.002, 0.008, num_epochs)
 
     voxel0 = image0 = val_voxel0 = val_image0 = None
 
@@ -490,6 +497,8 @@ if __name__ == '__main__':
     progress_bar = tqdm(range(epoch,num_epochs), disable=(local_rank!=0))
     start_device = device2 if args.train_rev_v2c else device
     pearson = PearsonCorrCoef(in_dims[subj_id]).to(start_device)
+    dino_loss = utils.DINOLoss(in_dims[subj_id], student_temp=0.01).to(start_device)
+    g_cuda = torch.Generator(device=device)
 
     for epoch in progress_bar:
         rev_diffusion_prior.train()
@@ -531,13 +540,15 @@ if __name__ == '__main__':
                 preds = rev_v2c(preds.to(start_device))
                 recons_mse = F.mse_loss(preds, voxel)
                 recons_corr = pearson(preds, voxel)
-                recons_corr_loss = (1 - recons_corr**2).mean()
+                # recons_corr_loss = (1 - recons_corr**2).mean()
+                recons_corr_loss = dino_loss(preds, voxel, temp=soft_loss_temps[epoch])
+
                 recons_loss = 0.1 * recons_mse + recons_corr_loss
                 recons_loss = recons_loss.to(device)
                 
                 loss_corr_sum += recons_corr_loss.item()
                 loss_recons_sum += recons_mse.item()
-                train_corr += torch.median((recons_corr**2)*100).item()
+                train_corr += ((recons_corr**2)*100).mean().item()
             else:
                 recons_loss = 0
 
@@ -569,7 +580,7 @@ if __name__ == '__main__':
         if local_rank==0:
             rev_diffusion_prior.eval()
             rev_v2c.eval()
-            for val_i, (voxel, latent) in enumerate(val_dl): 
+            for val_i, (voxel, _, latent) in enumerate(val_dl): 
                 with torch.inference_mode():
                     voxel = voxel.float().to(start_device)
                     voxel = voxel.mean(1)
@@ -577,14 +588,21 @@ if __name__ == '__main__':
 
                     intermediate_embs = voxel2clip(voxel)
                     
-                    val_loss, preds, _ = rev_diffusion_prior(text_embed=clip_target, image_embed=intermediate_embs.to(device))
+                    val_loss, preds, _ = rev_diffusion_prior(text_embed=clip_target, image_embed=intermediate_embs.to(device),
+                                                            times=torch.ones(clip_target.shape[0], dtype=torch.long).to(device) * (timesteps-1)
+                                                            )
+                    # preds = rev_diffusion_prior.p_sample_loop(
+                    #     clip_target.shape, 
+                    #     dict(text_embed = clip_target), 
+                    #     cond_scale = 1., timesteps = timesteps
+                    # )
                     preds = rev_v2c(preds.to(start_device))
                     
                     val_loss_mse_sum += val_loss.item()
                     val_losses.append(val_loss.item())
 
                     corr_coefs = pearson(preds, voxel)  # 30k
-                    val_corr = torch.median((corr_coefs**2)*100).item()
+                    val_corr = ((corr_coefs**2)*100).mean().item()
             
             logs = {"train/loss": np.mean(losses[-(train_i+1):]),
                     "val/loss": np.mean(val_losses[-(val_i+1):]),

@@ -95,7 +95,7 @@ class Clipper(torch.nn.Module):
             # from transformers import CLIPVisionModelWithProjection
             # image_encoder = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14",cache_dir="/fsx/proj-medarc/fmri/cache")
             from transformers import CLIPVisionModelWithProjection
-            sd_cache_dir = '/fsx/proj-medarc/fmri/cache/models--shi-labs--versatile-diffusion/snapshots/2926f8e11ea526b562cd592b099fcf9c2985d0b7'
+            sd_cache_dir = '/fsx/proj-fmri/shared/cache/models--shi-labs--versatile-diffusion/snapshots/2926f8e11ea526b562cd592b099fcf9c2985d0b7'
             image_encoder = CLIPVisionModelWithProjection.from_pretrained(sd_cache_dir, subfolder='image_encoder').to(device)
             image_encoder.eval()
             for param in image_encoder.parameters():
@@ -570,8 +570,18 @@ class BrainDiffusionPrior(DiffusionPrior):
     """
     def __init__(self, *args, **kwargs):
         voxel2clip = kwargs.pop('voxel2clip', None)
+        pre_noise_norm = kwargs.pop('pre_noise_norm', None)
         super().__init__(*args, **kwargs)
         self.voxel2clip = voxel2clip
+        if pre_noise_norm == 'bn':
+            self.pre_noise_norm = nn.BatchNorm1d(kwargs['image_embed_dim'], affine=False)
+            self.image_embed_scale=1.
+        elif pre_noise_norm == 'ln':
+            # self.pre_noise_norm = nn.LayerNorm(kwargs['image_embed_dim'], elementwise_affine=False)
+            # self.image_embed_scale=1.
+            raise ValueError()
+        else:
+            self.pre_noise_norm = None
 
     @torch.no_grad()
     def p_sample(self, x, t, text_cond = None, self_cond = None, clip_denoised = True, cond_scale = 1.,
@@ -612,6 +622,11 @@ class BrainDiffusionPrior(DiffusionPrior):
         if self.sampling_final_clamp_l2norm and self.predict_x_start:
             image_embed = self.l2norm_clamp_embed(image_embed)
 
+        # denormalizing with self.image_embed_scale happens in p_sample_loop
+        if self.pre_noise_norm is not None:
+            image_embed = image_embed * (
+                self.pre_noise_norm.running_var.reshape(1, 1, -1) + self.pre_noise_norm.eps
+            ) ** 0.5 + self.pre_noise_norm.running_mean.reshape(1, 1, -1)
         return image_embed
 
     def p_losses(self, image_embed, times, text_cond, noise = None):
@@ -690,20 +705,31 @@ class BrainDiffusionPrior(DiffusionPrior):
             text_cond = {**text_cond, 'text_encodings': text_encodings}
 
         # timestep conditioning from ddpm
-
         batch, device = image_embed.shape[0], image_embed.device
         if times is None:
             times = self.noise_scheduler.sample_random_times(batch)
 
-        # scale image embed (Katherine)
+        if self.pre_noise_norm is not None:
+            image_embed = image_embed.permute(0,2,1)
+            image_embed = self.pre_noise_norm(image_embed)
+            image_embed = image_embed.permute(0,2,1)
+        else:
+            # scale image embed (Katherine)
+            image_embed *= self.image_embed_scale
 
-        image_embed *= self.image_embed_scale
-
+        # print(f"Mean:  {image_embed.mean().item():.4f}, Var: {image_embed.std(1).mean().item():.4f}")
         # calculate forward loss
         loss, pred = self.p_losses(image_embed, times, text_cond = text_cond, *args, **kwargs)
+        # denorm pred
+        if self.pre_noise_norm is not None:
+            pred = pred * (
+                self.pre_noise_norm.running_var.reshape(1, 1, -1) + self.pre_noise_norm.eps
+            ) ** 0.5 + self.pre_noise_norm.running_mean.reshape(1, 1, -1)
+        else:
+            pred = pred/self.image_embed_scale
 
         # return denormalized pred, diff model learns to predict normalized pred
-        return loss, pred/self.image_embed_scale, (clip_voxels_mse, clip_voxels)
+        return loss, pred, (clip_voxels_mse, clip_voxels)
    
     @staticmethod
     def from_pretrained(net_kwargs={}, prior_kwargs={}, voxel2clip_path=None, ckpt_dir='./checkpoints'):
@@ -1190,23 +1216,28 @@ class TimeGuidedBrainNetwork(ReversibleBrainNetwork):
         # self.norm = nn.LayerNorm(out_dim)
         self.encoder_tokens = encoder_tokens
         self.time_scalers = nn.ModuleList([
-            nn.Linear(h, h*2) for _ in range(n_blocks+1)
+            nn.Linear(out_dim, h*2) for _ in range(n_blocks+1)
         ])
         self.h = h
+        self.reverse = reverse
+        self.encoder_tokens = encoder_tokens
+        self.out_dim = out_dim
 
     def forward(self, x, time_embed):
         x = self.lin0(x.flatten(1))  # bs, h
+        if time_embed.ndim==3:
+            time_embed=time_embed[:,0]
+        scale_shift = self.time_scalers[0](time_embed)
+        scale, shift = scale_shift.chunk(2, dim=1)  # bs,d 
+        x = x * (1 + scale) + shift
+
         residual = x
-        
-        scale_shift = self.time_scalers[0](time_embed).reshape(-1, 1, 2*self.h)
-        scale, shift = scale_shift.chunk(2, dim=2)  # bs,1,d 
-        residual = residual * (1 + scale) + shift
 
         for res_block in range(self.n_blocks):
             x = self.mlp[res_block](x)
 
-            scale_shift = self.time_scalers[res_block+1](time_embed).reshape(-1, 1, 2*self.h)
-            scale, shift = scale_shift.chunk(2, dim=2)  # bs,1,d
+            scale_shift = self.time_scalers[res_block+1](time_embed)
+            scale, shift = scale_shift.chunk(2, dim=1)  # bs,d
             x = x * (1 + scale) + shift
 
             x += residual
@@ -1214,6 +1245,8 @@ class TimeGuidedBrainNetwork(ReversibleBrainNetwork):
 
         x = x.reshape(len(x), -1)
         x = self.lin1(x)
+        if not self.reverse:
+            x = x.reshape(-1, self.encoder_tokens, self.out_dim)
         return x
 
 class C2VDiffusionPriorNetwork(VersatileDiffusionPriorNetwork):
@@ -1224,17 +1257,21 @@ class C2VDiffusionPriorNetwork(VersatileDiffusionPriorNetwork):
         num_time_embeds = 1,
         # num_image_embeds = 1,
         # num_brain_embeds = 1,
-        num_tokens = 257,
+        num_guid_tokens = 257,
+        num_interm_tokens = 128,
         causal = True,
         learned_query_mode = 'none',
         voxel_to_enc=nn.Identity(),
         enc_to_voxel=nn.Identity(),
         **kwargs
     ):
-        super().__init__(dim, num_timesteps, num_time_embeds, num_tokens,
+        super().__init__(dim, num_timesteps, num_time_embeds, num_guid_tokens,
                          causal, learned_query_mode, **kwargs)
         self.voxel_to_enc = voxel_to_enc
         self.enc_to_voxel = enc_to_voxel
+        del self.null_brain_embeds
+        self.learned_query = nn.Parameter(torch.randn(num_interm_tokens, dim) * dim**-0.5)
+        self.num_interm_tokens = num_interm_tokens
 
     def forward(
         self,
@@ -1254,13 +1291,16 @@ class C2VDiffusionPriorNetwork(VersatileDiffusionPriorNetwork):
         # mask out image embeddings with null image embeddings
         null_image_embed = self.null_image_embed.to(image_embed.dtype)
         image_embed = torch.where(
-            image_keep_mask,
+            image_keep_mask.to(image_embed.device),
             image_embed,
-            null_image_embed[None]
+            null_image_embed[None].to(image_embed.device)
         )
 
+        if self.continuous_embedded_time:
+            # if continuous cast to float, else keep int for indexing embeddings
+            diffusion_timesteps = diffusion_timesteps.type(dtype)
         time_embed = self.to_time_embeds(diffusion_timesteps)
-        intermediate_embed = self.voxel_to_enc(voxel, time_embed)
+        intermediate_embed = self.voxel_to_enc(voxel, time_embed.to(voxel.device))
 
         if self.learned_query_mode == 'token':
             learned_queries = repeat(self.learned_query, 'n d -> b n d', b = batch)
@@ -1273,8 +1313,8 @@ class C2VDiffusionPriorNetwork(VersatileDiffusionPriorNetwork):
         
         tokens = torch.cat((
             image_embed,  # 257
-            time_embed,  # 1
-            intermediate_embed,  # 257
+            time_embed.to(image_embed.device),  # 1
+            intermediate_embed.to(image_embed.device),  # 257
             learned_queries  # 0|257
         ), dim = -2)
 
@@ -1282,10 +1322,10 @@ class C2VDiffusionPriorNetwork(VersatileDiffusionPriorNetwork):
         tokens = self.causal_transformer(tokens)
 
         # get learned query, which should predict the image embedding (per DDPM timestep)
-        pred_voxel_embed = tokens[..., -self.num_tokens:, :]  # b,n,d
+        pred_voxel_embed = tokens[..., -self.num_interm_tokens:, :]  # b,n,d
         # processed time_embed vs unprocessed
         # pred_voxel = self.enc_to_voxel(pred_voxel_embed, tokens[:, self.num_tokens].unsqueeze(1))
-        pred_voxel = self.enc_to_voxel(pred_voxel_embed, time_embed)  # b,v
+        pred_voxel = self.enc_to_voxel(pred_voxel_embed.to(voxel.device), time_embed.to(voxel.device))  # b,v
         return pred_voxel
 
 class C2VBrainDiffusionPrior(BrainDiffusionPrior):
@@ -1323,7 +1363,7 @@ class C2VBrainDiffusionPrior(BrainDiffusionPrior):
     ):
         batch, device = image_embed.shape[0], voxel.device
         if times is None:
-            times = self.noise_scheduler.sample_random_times(batch)
+            times = self.noise_scheduler.sample_random_times(batch).to(voxel.device)
 
         # scale image embed (Katherine)
         # image_embed *= self.image_embed_scale

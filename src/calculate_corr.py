@@ -16,7 +16,7 @@ from kornia.augmentation.container import AugmentationSequential
 
 import utils
 from utils import torch_to_matplotlib, torch_to_Image
-from models import Clipper, OpenClipper, BrainNetworkNoDETR, ReverseBrainNetwork, VersatileDiffusionPriorNetwork, BrainDiffusionPrior
+from models import Clipper, OpenClipper, BrainNetworkNoDETR, ReversibleBrainNetwork, VersatileDiffusionPriorNetwork, BrainDiffusionPrior
 
 import torch.distributed as dist
 from accelerate import Accelerator
@@ -209,7 +209,7 @@ if __name__ == '__main__':
     
     # params for all models
     seed = 0
-    batch_size = 32
+    batch_size = 4096
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')    
 
     num_epochs = args.num_epochs
@@ -294,9 +294,10 @@ if __name__ == '__main__':
     in_dims = {'01': 39548, '02': 39548, '03': 39548, '04': 39548, '05': 39548, '06': 39198, '07': 39548, '08': 39511}
     voxel2clip_kwargs["in_dim"] = in_dims[subj_id]
     voxel2clip = BrainNetworkNoDETR(**voxel2clip_kwargs)
-    rev_v2c = ReverseBrainNetwork(**voxel2clip_kwargs)
+    rev_v2c = ReversibleBrainNetwork(**voxel2clip_kwargs)
 
-    diff_prior_path = f'/fsx/proj-fmri/paulscotti/fMRI-Algonauts-Challenge-2023/train_logs/v2c_subj{args.subj_id}/last.pth'
+    # diff_prior_path = f'/fsx/proj-fmri/paulscotti/fMRI-Algonauts-Challenge-2023/train_logs/v2c_subj{args.subj_id}/last.pth'
+    diff_prior_path = f'../train_logs/models/prior_fwd_bn_hialph/last.pth'
     diff_prior_weights = torch.load(diff_prior_path, map_location=device)['model_state_dict']
     v2c_weights = {}
     for k,v in diff_prior_weights.items():
@@ -322,7 +323,7 @@ if __name__ == '__main__':
     depth = 6
     dim_head = 64
     heads = 12 # heads * dim_head = 12 * 64 = 768
-    timesteps = 100
+    timesteps = 1000
     prior_network = VersatileDiffusionPriorNetwork(
         dim=out_dim,
         depth=depth,
@@ -339,11 +340,17 @@ if __name__ == '__main__':
         timesteps=timesteps,
         cond_drop_prob=0.2,
         image_embed_scale=None,
-        voxel2clip=None
+        voxel2clip=None,
+        pre_noise_norm='bn'
     ).to(device)
     suff = f'_s{args.subj_id}' if args.subj_id != '01' else ''
-    sd = torch.load(f'../train_logs/models/s3_s2_comb_nonpre{suff}/best.pth', map_location=device)
-    rev_diffusion_prior.load_state_dict(sd['model_state_dict'])
+    # sd = torch.load(f'../train_logs/models/s3_s2_comb_nonpre{suff}/best.pth', map_location=device)
+    # sd = torch.load(f'../train_logs/models/s3_pre_noise_bn_1000ts{suff}/best.pth', map_location=device)
+    sd = torch.load(f'../train_logs/models/prior_bwd_normfwd{suff}/best.pth', map_location=device)
+    try:
+        rev_diffusion_prior.load_state_dict(sd['model_state_dict'], strict=False)
+    except RuntimeError:
+        pass
     rev_diffusion_prior.eval()
     rev_diffusion_prior.requires_grad_(False)
     rev_v2c.load_state_dict(sd['rv2c_state_dict'])
@@ -353,11 +360,16 @@ if __name__ == '__main__':
     del sd
     pearson = PearsonCorrCoef(in_dims[subj_id]).to(device)
 
-    for val_i, (voxel, latent) in enumerate(val_dl): 
+    for val_i, (voxel, image, latent) in enumerate(train_dl): 
         with torch.inference_mode():
+            voxel = voxel.reshape(-1, voxel.shape[-1])
+            import pdb; pdb.set_trace()
+
+            
             voxel = voxel.float().to(device)
             voxel = voxel.mean(1)
             clip_target = latent.to(device).float().squeeze(1)
+            # import pdb; pdb.set_trace()
 
             intermediate_embs_orig = voxel2clip(voxel)
             
@@ -372,7 +384,7 @@ if __name__ == '__main__':
             _, ie_10, _ = rev_diffusion_prior(
                 text_embed=clip_target, 
                 image_embed=intermediate_embs_orig.to(device), 
-                times=torch.ones(clip_target.shape[0], dtype=torch.long).to(device)*10
+                times=torch.ones(clip_target.shape[0], dtype=torch.long).to(device)*(timesteps-1)
             )
             
             p10 = rev_v2c(ie_10)

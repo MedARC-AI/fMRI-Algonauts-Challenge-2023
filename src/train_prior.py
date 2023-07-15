@@ -307,7 +307,7 @@ if __name__ == '__main__':
     voxel2clip_kwargs = dict(out_dim=out_dim, norm_type='ln', act_first=False, encoder_tokens=128, use_projector=False)
     in_dims = {'01': 39548, '02': 39548, '03': 39548, '04': 39548, '05': 39548, '06': 39198, '07': 39548, '08': 39511}
     voxel2clip_kwargs["in_dim"] = in_dims[subj_id]
-    v2c = TimeGuidedBrainNetwork(revers=False, **voxel2clip_kwargs)
+    v2c = TimeGuidedBrainNetwork(reverse=False, **voxel2clip_kwargs)
     c2v = TimeGuidedBrainNetwork(**voxel2clip_kwargs)
 
     # setup prior network
@@ -322,6 +322,7 @@ if __name__ == '__main__':
         heads=heads,
         causal=False,
         learned_query_mode="pos_emb",
+        num_interm_tokens=voxel2clip_kwargs['encoder_tokens'],
         voxel_to_enc=v2c,
         enc_to_voxel=c2v
     ).to(device)
@@ -437,7 +438,7 @@ if __name__ == '__main__':
     epoch = 0
     losses, mse_losses, val_losses, lrs = [], [], [], []
     best_val_corr = 0
-    soft_loss_temps = utils.cosine_anneal(0.004, 0.0075, num_epochs)
+    soft_loss_temps = utils.cosine_anneal(0.002, 0.008, num_epochs)
 
     voxel0 = image0 = val_voxel0 = val_image0 = None
 
@@ -460,6 +461,13 @@ if __name__ == '__main__':
     progress_bar = tqdm(range(epoch,num_epochs), disable=(local_rank!=0))
     start_device = device2 if args.train_rev_v2c else device
     pearson = PearsonCorrCoef(in_dims[subj_id]).to(start_device)
+    dino_loss = utils.DINOLoss(in_dims[subj_id], student_temp=0.01).to(start_device)
+    # rev_diffusion_prior.net.voxel_to_enc.to(start_device)
+    # rev_diffusion_prior.net.enc_to_voxel.to(start_device)
+    # rev_diffusion_prior.net.to_time_embeds.to(start_device)
+    rev_diffusion_prior.to(start_device)
+    rev_diffusion_prior.net.causal_transformer.to(device)
+
 
     for epoch in progress_bar:
         rev_diffusion_prior.train()
@@ -492,7 +500,8 @@ if __name__ == '__main__':
 
             loss, preds = rev_diffusion_prior(voxel, image_embed=clip_target_prior)
             recons_corr = pearson(preds, voxel)
-            recons_corr_loss = utils.soft_corr_loss(preds, voxel, temp=soft_loss_temps[epoch])
+            # recons_corr_loss = utils.soft_corr_loss(preds.to(device), voxel.to(device), temp=soft_loss_temps[epoch])
+            recons_corr_loss = dino_loss(preds, voxel, temp=soft_loss_temps[epoch])
             
             loss_corr_sum += recons_corr_loss.item()
             train_corr += ((recons_corr**2)*100).mean().item()
@@ -530,9 +539,9 @@ if __name__ == '__main__':
                     voxel = voxel.mean(1)
                     clip_target = latent.to(device).float().squeeze(1)
                     
-                    val_loss, preds, _ = rev_diffusion_prior(
-                        text_embed=clip_target, image_embed=voxel, 
-                        times=torch.zeros(clip_target.shape[0], dtype=torch.long).to(device)
+                    val_loss, preds = rev_diffusion_prior(
+                        voxel, image_embed=clip_target, 
+                        times=torch.zeros(clip_target.shape[0], dtype=torch.long).to(start_device)
                     )
                     
                     val_loss_mse_sum += val_loss.item()
